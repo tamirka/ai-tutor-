@@ -1,0 +1,7 @@
+{
+  "name": "Live AI Tutor",
+  "description": "An interactive AI tutor that helps students learn about various subjects like Math, History, Geography, and Science through live voice conversations.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
