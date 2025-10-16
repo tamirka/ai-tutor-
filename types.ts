@@ -1,7 +1,7 @@
 import React from 'react';
 
 export interface ChatMessage {
-  role: 'user' | 'model' | 'system';
+  role: 'user' | 'assistant' | 'system';
   content: string;
 }
 

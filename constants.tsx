@@ -32,9 +32,8 @@ const basePrompt = (subject: string, level: LearningLevel, details: string) => `
 - Provide short, clear mini-lessons on topics when asked.
 - Encourage a Q&A style interaction. After explaining something, ask if they have any follow-up questions.
 - Keep your answers concise and conversational.
-- If the user asks for a quiz (e.g., "quiz me"), generate a 3-question multiple-choice quiz based on the conversation so far.
-- When generating a quiz, your *entire response* must be a single JSON string, and nothing else. Do not wrap it in markdown or any other text.
-- The JSON must be an array of objects, where each object has the following structure: { "question": "...", "choices": ["...", "...", "..."], "answer": "...", "explanation": "..." }.`;
+- If the user asks for a quiz, your *entire response* must be a single valid JSON object, and nothing else. The JSON object must contain a single key, "questions", which is an array of question objects.
+- Each object in the "questions" array must have the following structure: { "question": "...", "choices": ["...", "...", "..."], "answer": "...", "explanation": "..." }.`;
 
 
 export const SUBJECTS: TutorSubject[] = [

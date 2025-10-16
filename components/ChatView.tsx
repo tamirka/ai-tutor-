@@ -1,12 +1,10 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Chat } from '@google/genai';
-import { createTutorSession } from '../services/geminiService';
+import { getOpenAIStreamedResponse, getOpenAIQuiz } from '../services/geminiService';
 import { progressService } from '../services/progressService';
 import { TutorSubject, ChatMessage, LearningLevel, QuizQuestion } from '../types';
 import QuizView from './QuizView';
 
 // TypeScript interfaces for Web Speech API
-// FIX: Add missing resultIndex property to fix error on line 65.
 interface SpeechRecognitionEvent extends Event {
   results: SpeechRecognitionResultList;
   resultIndex: number;
@@ -18,7 +16,6 @@ interface SpeechRecognitionResult {
 interface SpeechRecognitionAlternative {
   transcript: string;
 }
-// FIX: Add missing onresult property to fix error on line 63.
 interface SpeechRecognition extends EventTarget {
   continuous: boolean;
   interimResults: boolean;
@@ -47,13 +44,19 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [quiz, setQuiz] = useState<QuizQuestion[] | null>(null);
   
-  const chatSessionRef = useRef<Chat | null>(null);
   const recognitionRef = useRef<SpeechRecognition | null>(null);
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
   useEffect(() => {
-    chatSessionRef.current = createTutorSession(subject, level);
-    setMessages([{ role: 'model', content: `Hello! I'm your ${subject.name} tutor. What would you like to learn about today?` }]);
+    const systemMessage: ChatMessage = {
+      role: 'system',
+      content: subject.prompt(level),
+    };
+    const initialAssistantMessage: ChatMessage = {
+      role: 'assistant',
+      content: `Hello! I'm your ${subject.name} tutor. What would you like to learn about today?`,
+    };
+    setMessages([systemMessage, initialAssistantMessage]);
   }, [subject, level]);
 
   useEffect(() => {
@@ -80,22 +83,20 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
   }, []);
   
   useEffect(() => {
-    // Save lesson on component unmount
     return () => {
-      // Don't save if there's only the initial message
-      if (messages.length > 1) {
+      // Don't save if there's only the system prompt and initial message
+      if (messages.length > 2) {
         progressService.saveLesson({
           subject: subject.name,
           level: level,
           date: new Date().toISOString(),
-          messageCount: messages.length,
+          messageCount: messages.filter(m => m.role !== 'system').length,
         });
       }
     };
   }, [messages, subject, level]);
 
   const speak = (text: string) => {
-    // If speaking, cancel previous speech
     if (window.speechSynthesis.speaking) {
       window.speechSynthesis.cancel();
     }
@@ -115,53 +116,98 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
 
   const handleUserMessage = async (text: string) => {
     if (!text || isResponding) return;
-    setIsResponding(true);
-    setMessages(prev => [...prev, { role: 'user', content: text }]);
-    
-    // Check for quiz request
+
     if (text.toLowerCase().includes('quiz me')) {
-      handleQuizRequest(text);
-      return;
+        startQuiz();
+        return;
     }
 
+    setIsResponding(true);
+    const newUserMessage: ChatMessage = { role: 'user', content: text };
+    const updatedMessages = [...messages, newUserMessage];
+    setMessages(updatedMessages);
+
+    const apiMessages = updatedMessages.filter(msg => msg.role !== 'system' || msg.content.includes('You are a friendly'));
+    
     try {
-      if (chatSessionRef.current) {
-        const stream = await chatSessionRef.current.sendMessageStream({ message: text });
+        const stream = await getOpenAIStreamedResponse(apiMessages);
+        if (!stream) throw new Error("Response body is null");
+
+        const reader = stream.getReader();
+        const decoder = new TextDecoder();
         let fullResponse = '';
-        setMessages(prev => [...prev, { role: 'model', content: '' }]);
-        for await (const chunk of stream) {
-          fullResponse += chunk.text;
-          setMessages(prev => {
-              const newMessages = [...prev];
-              newMessages[newMessages.length - 1] = { role: 'model', content: fullResponse };
-              return newMessages;
-          });
+        setMessages(prev => [...prev, { role: 'assistant', content: '' }]);
+
+        let continueReading = true;
+        while (continueReading) {
+            const { done, value } = await reader.read();
+            if (done) {
+                continueReading = false;
+                break;
+            }
+            const chunk = decoder.decode(value, { stream: true });
+            const lines = chunk.split('\n').filter(line => line.trim() !== '');
+
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    const data = line.substring(6);
+                    if (data === '[DONE]') {
+                        continueReading = false;
+                        break;
+                    }
+                    try {
+                        const json = JSON.parse(data);
+                        const content = json.choices[0]?.delta?.content || '';
+                        if (content) {
+                            fullResponse += content;
+                            setMessages(prev => {
+                                const newMessages = [...prev];
+                                newMessages[newMessages.length - 1] = { role: 'assistant', content: fullResponse };
+                                return newMessages;
+                            });
+                        }
+                    } catch (e) {
+                        console.error('Error parsing stream data chunk:', data, e);
+                    }
+                }
+            }
         }
-        speak(fullResponse);
-      }
+        if (fullResponse) speak(fullResponse);
     } catch (error) {
-      console.error('Gemini API error:', error);
-      const errorMessage = 'Sorry, I encountered an error. Please try again.';
-      setMessages(prev => [...prev, { role: 'model', content: errorMessage }]);
-      speak(errorMessage);
+        console.error('OpenAI API error:', error);
+        const errorMessage = 'Sorry, I encountered an error. Please try again.';
+        setMessages(prev => {
+            const newMessages = [...prev];
+            if(newMessages[newMessages.length - 1].role === 'assistant' && newMessages[newMessages.length - 1].content === '') {
+                newMessages[newMessages.length-1] = { role: 'assistant', content: errorMessage };
+                return newMessages;
+            }
+            return [...newMessages, { role: 'assistant', content: errorMessage }];
+        });
+        speak(errorMessage);
     } finally {
-      setIsResponding(false);
+        setIsResponding(false);
     }
   };
   
-  const handleQuizRequest = async (text: string) => {
+  const startQuiz = () => {
+    if (isResponding || messages.length < 2) return;
+    setIsResponding(true);
+    const quizRequestMessage: ChatMessage = { role: 'user', content: "Quiz me on what we've discussed. Please respond with JSON." };
+    const updatedMessages = [...messages, quizRequestMessage];
+    setMessages(updatedMessages);
+    handleQuizRequest(updatedMessages);
+  }
+
+  const handleQuizRequest = async (messageHistory: ChatMessage[]) => {
     try {
-        if (chatSessionRef.current) {
-            // Use a non-streaming call for JSON
-            const response = await chatSessionRef.current.sendMessage({ message: text });
-            const jsonText = response.text.trim();
-            const quizData = JSON.parse(jsonText);
-            setQuiz(quizData);
-        }
+        const apiMessages = messageHistory.filter(msg => msg.role !== 'system' || msg.content.includes('You are a friendly'));
+        const quizData = await getOpenAIQuiz(apiMessages);
+        setQuiz(quizData);
     } catch (error) {
         console.error('Failed to parse quiz JSON:', error);
         const errorMessage = "I had trouble creating a quiz. Let's try something else.";
-        setMessages(prev => [...prev, { role: 'model', content: errorMessage }]);
+        setMessages(prev => [...prev, { role: 'assistant', content: errorMessage }]);
         speak(errorMessage);
     } finally {
         setIsResponding(false);
@@ -180,7 +226,12 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
 
   const handleClearChat = () => {
     if (window.confirm('Are you sure you want to clear this conversation?')) {
-      setMessages([{ role: 'model', content: `Hello! Let's start over. What would you like to learn about ${subject.name}?` }]);
+      const systemMessage: ChatMessage = { role: 'system', content: subject.prompt(level) };
+      const initialAssistantMessage: ChatMessage = {
+        role: 'assistant',
+        content: `Hello! Let's start over. What would you like to learn about ${subject.name}?`,
+      };
+      setMessages([systemMessage, initialAssistantMessage]);
     }
   };
   
@@ -189,7 +240,6 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
     setQuiz(null);
     setMessages(prev => [...prev, { role: 'system', content: summary }]);
     speak(summary);
-    // Save quiz result
     progressService.saveQuiz({
       subject: subject.name,
       level: level,
@@ -210,7 +260,7 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
         <h2 className="text-2xl font-bold text-center">{subject.name} Tutor</h2>
         <div className="flex justify-end space-x-2">
            <button 
-              onClick={() => handleUserMessage("Quiz me on what we've discussed.")}
+              onClick={startQuiz}
               disabled={isResponding || messages.length < 2}
               className="px-3 py-1.5 text-sm font-semibold rounded-md bg-white/20 hover:bg-white/30 disabled:opacity-50 disabled:cursor-not-allowed"
            >
@@ -230,7 +280,7 @@ const ChatView: React.FC<ChatViewProps> = ({ subject, level, onBack }) => {
       </header>
       
       <div className="flex-1 p-6 overflow-y-auto space-y-4">
-        {messages.map((msg, index) => (
+        {messages.filter((msg, index) => index > 0 || msg.role !== 'system').map((msg, index) => (
           <div key={index} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
             <div className={`max-w-xl px-4 py-2 rounded-2xl ${msg.role === 'user' ? `${subject.primaryColor} text-white` : 'bg-gray-100 text-gray-800'} ${msg.role === 'system' ? 'w-full text-center bg-yellow-100 text-yellow-800 font-medium' : ''}`}>
               {msg.content}
